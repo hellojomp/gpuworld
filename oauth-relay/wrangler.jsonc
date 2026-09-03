@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "verso-oauth-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-03",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    // Set to your GitHub Pages origin (e.g. "https://you.github.io") once deployed.
+    // "*" works everywhere but allows any site to use this relay.
+    "ALLOWED_ORIGIN": "*"
+  }
+}
