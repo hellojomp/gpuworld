@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/streetsidesoftware/cspell/main/cspell.schema.json",
+  "version": "0.2",
+  "language": "en,en-GB",
+  "dictionaries": ["companies", "softwareTerms", "misc"],
+  "words": [
+    "gpuworld",
+    "hellojomp",
+    "civonamo",
+    "verso",
+    "oauth",
+    "wrangler",
+    "cloudflare",
+    "workerd",
+    "jsdelivr",
+    "jsdiff",
+    "turndown",
+    "cspell",
+    "contenteditable",
+    "octocat",
+    "webhooks"
+  ],
+  "ignorePaths": [
+    "node_modules/**",
+    "oauth-relay/node_modules/**",
+    "**/package-lock.json",
+    "**/*.lock",
+    ".wrangler/**",
+    ".git/**"
+  ]
+}

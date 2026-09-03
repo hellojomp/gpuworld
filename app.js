@@ -3,11 +3,21 @@
 
   const GITHUB_API = "https://api.github.com";
 
+  // Public identifiers for this deployment — not secrets. An OAuth Client ID
+  // is meant to be public (only the client secret is confidential, and
+  // device flow never uses one), and the relay URL is just an endpoint.
+  const DEFAULT_OAUTH_CLIENT_ID = "Ov23liUgG4S7nbL9Bv54";
+  const DEFAULT_OAUTH_RELAY_URL = "https://gpuworld-oauth-relay.civonamo.workers.dev";
+  const DEFAULT_OWNER = "hellojomp";
+  const DEFAULT_REPO = "gpuworld";
+  const DEFAULT_BRANCH = "master";
+  const DEFAULT_PATH = "test.md";
+
   const els = {
     submitButton: document.getElementById("submit-button"),
-    snapshotBanner: document.getElementById("snapshot-banner"),
-    snapshotCopy: document.getElementById("snapshot-copy"),
-    returnToDraft: document.getElementById("return-to-draft"),
+    revisionLabel: document.getElementById("revision-label"),
+    revisionHash: document.getElementById("revision-hash"),
+    revisionMessage: document.getElementById("revision-message"),
     commitLog: document.getElementById("commit-log"),
     editor: document.getElementById("editor"),
     wordCount: document.getElementById("word-count"),
@@ -27,6 +37,9 @@
     repoToken: document.getElementById("repo-token"),
     settingsError: document.getElementById("settings-error"),
     connectButton: document.getElementById("connect-button"),
+    manualSetup: document.getElementById("manual-setup"),
+    resetButton: document.getElementById("reset-button"),
+    changeRepoButton: document.getElementById("change-repo-button"),
     oauthClientId: document.getElementById("oauth-client-id"),
     oauthRelayUrl: document.getElementById("oauth-relay-url"),
     deviceConnectButton: document.getElementById("device-connect-button"),
@@ -74,8 +87,8 @@
   const state = {
     repo: store.get(REPO_KEY, null), // { owner, repo, path, branch }
     token: store.get(TOKEN_KEY, ""),
-    oauthClientId: store.get(OAUTH_CLIENT_ID_KEY, ""),
-    oauthRelayUrl: store.get(OAUTH_RELAY_URL_KEY, ""),
+    oauthClientId: store.get(OAUTH_CLIENT_ID_KEY, DEFAULT_OAUTH_CLIENT_ID),
+    oauthRelayUrl: store.get(OAUTH_RELAY_URL_KEY, DEFAULT_OAUTH_RELAY_URL),
     sha: null, // sha of the file's current blob, needed to push the next update
     commits: [],
     viewingSha: null,
@@ -121,9 +134,13 @@
     toastTimer = setTimeout(() => els.toast.classList.remove("is-visible"), 3200);
   }
 
-  function updateWordCount() {
+  function currentWordCount() {
     const text = els.editor.textContent.trim();
-    const count = text ? text.split(/\s+/).length : 0;
+    return text ? text.split(/\s+/).length : 0;
+  }
+
+  function updateWordCount() {
+    const count = currentWordCount();
     els.wordCount.textContent = `${count} word${count === 1 ? "" : "s"}`;
   }
 
@@ -193,6 +210,7 @@
       sha: c.sha,
       shortSha: c.sha.slice(0, 7),
       message: c.commit.message.split("\n")[0],
+      parentSha: c.parents?.[0]?.sha || null,
     }));
   }
 
@@ -234,15 +252,43 @@
     }
   }
 
+  // Renders the word-level diff introduced by a commit (vs. its parent) as
+  // plain highlighted text — not rendered markdown, since splicing <ins>/<del>
+  // spans into arbitrary markdown and re-parsing it would break on any diff
+  // that lands mid-syntax (a split heading marker, an unbalanced list, etc).
+  function renderDiff(oldText, newText) {
+    const parts = Diff.diffWords(oldText, newText);
+    els.editor.innerHTML = parts
+      .map((part) => {
+        const text = escapeHtml(part.value);
+        if (part.added) return `<ins class="diff-add">${text}</ins>`;
+        if (part.removed) return `<del class="diff-del">${text}</del>`;
+        return text;
+      })
+      .join("");
+  }
+
   async function previewCommit(commit) {
     if (!state.repo) return;
     try {
-      const { markdown } = await fetchFile(state.repo, commit.sha);
+      const { markdown: newMarkdown } = await fetchFile(state.repo, commit.sha);
+
+      let oldMarkdown = "";
+      if (commit.parentSha) {
+        try {
+          oldMarkdown = (await fetchFile(state.repo, commit.parentSha)).markdown;
+        } catch (err) {
+          if (err.code !== "not_found") throw err; // parent existed; file just didn't yet — empty is correct
+        }
+      }
+
       state.viewingSha = commit.sha;
       els.editor.contentEditable = "false";
-      setEditorFromMarkdown(markdown);
-      els.snapshotCopy.textContent = `Viewing ${commit.shortSha} · ${commit.message}`;
-      els.snapshotBanner.hidden = false;
+      els.editor.classList.add("is-diff");
+      renderDiff(oldMarkdown, newMarkdown);
+      els.revisionHash.textContent = commit.shortSha;
+      els.revisionMessage.textContent = commit.message;
+      els.revisionLabel.hidden = false;
       renderCommitLog();
     } catch (err) {
       showToast(`Couldn't load that revision: ${err.message}`, true);
@@ -252,7 +298,8 @@
   function returnToDraft() {
     state.viewingSha = null;
     els.editor.contentEditable = "true";
-    els.snapshotBanner.hidden = true;
+    els.editor.classList.remove("is-diff");
+    els.revisionLabel.hidden = true;
     setEditorFromMarkdown(store.get(draftKey(state.repo), ""));
     updateWordCount();
     renderCommitLog();
@@ -302,14 +349,66 @@
   // ---------- settings / connect flow ----------
 
   function populateSettingsForm() {
-    els.repoOwner.value = state.repo?.owner || "";
-    els.repoName.value = state.repo?.repo || "";
-    els.repoPath.value = state.repo?.path || "";
-    els.repoBranch.value = state.repo?.branch || "main";
+    els.repoOwner.value = state.repo?.owner || DEFAULT_OWNER;
+    els.repoName.value = state.repo?.repo || DEFAULT_REPO;
+    els.repoPath.value = state.repo?.path || DEFAULT_PATH;
+    els.repoBranch.value = state.repo?.branch || DEFAULT_BRANCH;
     els.repoToken.value = state.token || "";
     els.oauthClientId.value = state.oauthClientId || "";
     els.oauthRelayUrl.value = state.oauthRelayUrl || "";
     els.settingsError.hidden = true;
+  }
+
+  function repoFromForm() {
+    return {
+      owner: els.repoOwner.value.trim() || DEFAULT_OWNER,
+      repo: els.repoName.value.trim() || DEFAULT_REPO,
+      path: els.repoPath.value.trim().replace(/^\/+/, "") || DEFAULT_PATH,
+      branch: els.repoBranch.value.trim() || DEFAULT_BRANCH,
+    };
+  }
+
+  // Loads a file from GitHub into the editor and updates all connection
+  // state. A missing file still counts as a valid connection — the first
+  // push will create it. Throws on any other failure.
+  async function connectToRepo(repo) {
+    try {
+      const { markdown, sha } = await fetchFile(repo);
+      state.repo = repo;
+      state.sha = sha;
+      store.set(REPO_KEY, repo);
+      setEditorFromMarkdown(markdown);
+      store.set(draftKey(repo), markdown);
+      state.viewingSha = null;
+      els.revisionLabel.hidden = true;
+      updateWordCount();
+      updateRepoTarget();
+      await refreshCommitLog();
+      showToast(`Loaded ${repo.path} from ${repo.owner}/${repo.repo}`);
+    } catch (err) {
+      if (err.code !== "not_found") throw err;
+      state.repo = repo;
+      state.sha = null;
+      store.set(REPO_KEY, repo);
+      updateRepoTarget();
+      await refreshCommitLog();
+      showToast(`Connected. ${repo.path} doesn't exist yet — your first push will create it.`);
+    }
+  }
+
+  function resetConnection() {
+    state.repo = null;
+    state.sha = null;
+    state.commits = [];
+    state.viewingSha = null;
+    store.set(REPO_KEY, null);
+
+    els.editor.contentEditable = "true";
+    els.revisionLabel.hidden = true;
+    renderCommitLog();
+    updateRepoTarget();
+    populateSettingsForm();
+    showToast("Connection reset. Reconnect below.");
   }
 
   // ---------- GitHub OAuth device flow ----------
@@ -426,23 +525,26 @@
     let login = null;
     try {
       const res = await fetch(`${GITHUB_API}/user`, { headers: authHeaders() });
-      if (res.ok) {
-        const user = await res.json();
-        login = user.login;
-        if (!els.repoOwner.value) els.repoOwner.value = user.login;
-      }
+      if (res.ok) login = (await res.json()).login;
     } catch {
       /* fall through to the generic message below */
     }
     showToast(login ? `Connected as ${login}.` : "Connected to GitHub.");
 
-    // If a repo is already configured, this login was the only missing piece —
-    // go straight to the commit dialog instead of making the user click again.
-    if (state.repo) {
-      els.settingsModal.close();
-      await refreshCommitLog();
-      openPushModal();
+    // Authorization was the only missing piece — load the manuscript and go
+    // straight to the commit dialog instead of making the user do more.
+    if (!state.repo) {
+      try {
+        await connectToRepo(repoFromForm());
+      } catch (err) {
+        els.settingsError.textContent = err.message;
+        els.settingsError.hidden = false;
+        els.manualSetup.open = true;
+        return;
+      }
     }
+    els.settingsModal.close();
+    openPushModal();
   }
 
   function cancelDeviceFlow() {
@@ -451,12 +553,7 @@
 
   async function handleConnectSubmit(event) {
     event.preventDefault();
-    const repo = {
-      owner: els.repoOwner.value.trim(),
-      repo: els.repoName.value.trim(),
-      path: els.repoPath.value.trim().replace(/^\/+/, ""),
-      branch: els.repoBranch.value.trim() || "main",
-    };
+    const repo = repoFromForm();
     const token = els.repoToken.value.trim();
 
     els.connectButton.disabled = true;
@@ -464,40 +561,16 @@
     els.settingsError.hidden = true;
 
     try {
-      state.token = token;
-      store.set(TOKEN_KEY, token);
-
-      const { markdown, sha } = await fetchFile(repo);
-
-      state.repo = repo;
-      state.sha = sha;
-      store.set(REPO_KEY, repo);
-
-      setEditorFromMarkdown(markdown);
-      store.set(draftKey(repo), markdown);
-      state.viewingSha = null;
-      els.snapshotBanner.hidden = true;
-      updateWordCount();
-      updateRepoTarget();
-      await refreshCommitLog();
+      if (token) {
+        state.token = token;
+        store.set(TOKEN_KEY, token);
+      }
+      await connectToRepo(repo);
       els.settingsModal.close();
-      showToast(`Loaded ${repo.path} from ${repo.owner}/${repo.repo}`);
       if (state.token) openPushModal();
     } catch (err) {
-      if (err.code === "not_found") {
-        // New file: nothing to load yet, but the connection itself is valid.
-        state.repo = repo;
-        state.sha = null;
-        store.set(REPO_KEY, repo);
-        updateRepoTarget();
-        await refreshCommitLog();
-        els.settingsModal.close();
-        showToast(`Connected. ${repo.path} doesn't exist yet — your first push will create it.`);
-        if (state.token) openPushModal();
-      } else {
-        els.settingsError.textContent = err.message;
-        els.settingsError.hidden = false;
-      }
+      els.settingsError.textContent = err.message;
+      els.settingsError.hidden = false;
     } finally {
       els.connectButton.disabled = false;
       els.connectButton.textContent = "Load from GitHub";
@@ -524,12 +597,25 @@
     els.pushMessage.focus();
   }
 
+  function openSettingsFromPush() {
+    els.submitModal.close();
+    populateSettingsForm();
+    openModal(els.settingsModal);
+  }
+
   async function handlePush() {
     const message = els.pushMessage.value.trim();
     if (!message) {
       els.pushError.textContent = "Give this commit a message.";
       els.pushError.hidden = false;
       els.pushMessage.focus();
+      return;
+    }
+
+    const wordCount = currentWordCount();
+    if (wordCount >= MAX_WORD_COUNT) {
+      els.pushError.textContent = `This manuscript is ${wordCount} words — must stay under ${MAX_WORD_COUNT} to push. (See constants.js.)`;
+      els.pushError.hidden = false;
       return;
     }
 
@@ -554,7 +640,8 @@
       state.sha = result.fileSha;
       store.set(draftKey(state.repo), markdown);
 
-      state.commits.unshift({ sha: result.commitSha, shortSha: result.commitSha.slice(0, 7), message });
+      const parentSha = state.commits[0]?.sha || null;
+      state.commits.unshift({ sha: result.commitSha, shortSha: result.commitSha.slice(0, 7), message, parentSha });
       renderCommitLog();
 
       els.submitModal.close();
@@ -624,15 +711,17 @@
     els.selectionTools.addEventListener("click", handleToolbarClick);
 
     els.settingsForm.addEventListener("submit", handleConnectSubmit);
+    els.resetButton.addEventListener("click", resetConnection);
     els.settingsModal.addEventListener("close", cancelDeviceFlow);
     els.deviceConnectButton.addEventListener("click", startDeviceFlow);
     els.deviceFlowCancel.addEventListener("click", cancelDeviceFlow);
 
     els.submitButton.addEventListener("click", openPushModal);
     els.pushButton.addEventListener("click", handlePush);
+    els.changeRepoButton.addEventListener("click", openSettingsFromPush);
     els.downloadButton.addEventListener("click", handleDownload);
 
-    els.returnToDraft.addEventListener("click", returnToDraft);
+    els.revisionLabel.addEventListener("click", returnToDraft);
   }
 
   init();

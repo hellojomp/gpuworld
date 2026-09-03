@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Blocks a commit if the manuscript exceeds MAX_WORD_COUNT (see constants.js).
+#
+# This only fires on local `git commit` — it never sees pushes made through
+# the app's own "Commit & push" button, since that writes straight to the
+# GitHub API and never runs git locally. The app enforces the same limit
+# itself for that path (see handlePush in app.js).
+#
+# Activate with: git config core.hooksPath .githooks
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+CONSTANTS_FILE="$REPO_ROOT/constants.js"
+MANUSCRIPT_FILE="test.md"
+
+# Only check when the manuscript is actually part of this commit.
+if ! git diff --cached --name-only | grep -qx "$MANUSCRIPT_FILE"; then
+  exit 0
+fi
+
+if [ ! -f "$CONSTANTS_FILE" ]; then
+  echo "pre-commit: constants.js not found — skipping word count check." >&2
+  exit 0
+fi
+
+MAX_WORDS="$(grep -oE 'MAX_WORD_COUNT[[:space:]]*=[[:space:]]*[0-9]+' "$CONSTANTS_FILE" | grep -oE '[0-9]+$' | head -1)"
+if [ -z "$MAX_WORDS" ]; then
+  echo "pre-commit: could not read MAX_WORD_COUNT from constants.js — skipping check." >&2
+  exit 0
+fi
+
+# Count words in the staged version of the file, not whatever's on disk.
+WORD_COUNT="$(git show ":$MANUSCRIPT_FILE" | wc -w | tr -d ' ')"
+
+if [ "$WORD_COUNT" -ge "$MAX_WORDS" ]; then
+  echo "pre-commit: $MANUSCRIPT_FILE is $WORD_COUNT words — must stay under $MAX_WORDS." >&2
+  exit 1
+fi
+
+echo "pre-commit: $MANUSCRIPT_FILE is $WORD_COUNT/$MAX_WORDS words. OK."
