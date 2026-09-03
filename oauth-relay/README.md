@@ -23,7 +23,7 @@ allowed to read the response.
    npx wrangler deploy
    ```
 
-   This prints your Worker's URL, e.g. `https://verso-oauth-relay.<you>.workers.dev`.
+   This prints your Worker's URL, e.g. `https://gpuworld-oauth-relay.<you>.workers.dev`.
 
 3. Optionally lock the relay to your own site instead of any origin:
 
