@@ -13,21 +13,27 @@
   const DEFAULT_BRANCH = "master";
   const DEFAULT_PATH = "test.md";
 
+  function defaultRepo() {
+    return {
+      owner: DEFAULT_OWNER,
+      repo: DEFAULT_REPO,
+      path: DEFAULT_PATH,
+      branch: DEFAULT_BRANCH,
+    };
+  }
+
   const els = {
     submitButton: document.getElementById("submit-button"),
+    rebaseButton: document.getElementById("rebase-button"),
     revisionLabel: document.getElementById("revision-label"),
     revisionHash: document.getElementById("revision-hash"),
     revisionMessage: document.getElementById("revision-message"),
     commitLog: document.getElementById("commit-log"),
     editor: document.getElementById("editor"),
     wordCount: document.getElementById("word-count"),
+    settingsButton: document.getElementById("settings-button"),
     selectionTools: document.getElementById("selection-tools"),
-    submitModal: document.getElementById("submit-modal"),
-    pushMessage: document.getElementById("push-message"),
-    repoTarget: document.getElementById("repo-target"),
-    pushError: document.getElementById("push-error"),
     downloadButton: document.getElementById("download-button"),
-    pushButton: document.getElementById("push-button"),
     settingsModal: document.getElementById("settings-modal"),
     settingsForm: document.getElementById("settings-form"),
     repoOwner: document.getElementById("repo-owner"),
@@ -39,7 +45,6 @@
     connectButton: document.getElementById("connect-button"),
     manualSetup: document.getElementById("manual-setup"),
     resetButton: document.getElementById("reset-button"),
-    changeRepoButton: document.getElementById("change-repo-button"),
     oauthClientId: document.getElementById("oauth-client-id"),
     oauthRelayUrl: document.getElementById("oauth-relay-url"),
     deviceConnectButton: document.getElementById("device-connect-button"),
@@ -82,6 +87,21 @@
     return repo ? `verso:draft:${repo.owner}/${repo.repo}/${repo.path}` : "verso:draft:local";
   }
 
+  // The markdown as last synced with GitHub — distinct from the draft, which
+  // tracks live (possibly unsynced) edits. Used to compute what changed
+  // locally so it can be rebased onto someone else's intervening push.
+  function baseKey(repo) {
+    return repo ? `verso:base:${repo.owner}/${repo.repo}/${repo.path}` : "verso:base:local";
+  }
+
+  function shaKey(repo) {
+    return repo ? `verso:sha:${repo.owner}/${repo.repo}/${repo.path}` : "verso:sha:local";
+  }
+
+  function headKey(repo) {
+    return repo ? `verso:head:${repo.owner}/${repo.repo}/${repo.path}` : "verso:head:local";
+  }
+
   // ---------- state ----------
 
   const state = {
@@ -89,12 +109,23 @@
     token: store.get(TOKEN_KEY, ""),
     oauthClientId: store.get(OAUTH_CLIENT_ID_KEY, DEFAULT_OAUTH_CLIENT_ID),
     oauthRelayUrl: store.get(OAUTH_RELAY_URL_KEY, DEFAULT_OAUTH_RELAY_URL),
-    sha: null, // sha of the file's current blob, needed to push the next update
+    sha: null, // blob SHA of the last successful sync (matches baseMarkdown)
+    syncedCommitSha: null, // commit SHA we last synced to
+    behind: false,
+    baseMarkdown: "",
     commits: [],
     viewingSha: null,
   };
 
   let devicePollTimer = null;
+  let remotePollTimer = null;
+  let remotePeekInFlight = false;
+  let lastRemotePeekAt = 0;
+  let pushInFlight = false;
+  let pendingPushAfterAuth = false;
+
+  const REMOTE_POLL_MS = 45_000;
+  const REMOTE_POLL_MS_UNAUTH = 180_000;
 
   // ---------- utilities ----------
 
@@ -117,6 +148,67 @@
 
   function setEditorFromMarkdown(markdown) {
     els.editor.innerHTML = marked.parse(markdown || "");
+  }
+
+  // Round-trips markdown through the same marked→HTML→turndown pipeline the
+  // editor itself uses. Needed because that pipeline reflows line breaks
+  // (markdown joins soft-wrapped lines within a paragraph into one line), so
+  // raw GitHub content and editorMarkdown() output aren't line-comparable
+  // otherwise — every push would look like it touched every wrapped line.
+  function canonicalMarkdown(markdown) {
+    return turndown.turndown(marked.parse(markdown || "")).trim() + "\n";
+  }
+
+  // Splits on whitespace runs, keeping them as their own tokens so the
+  // array rejoins (with "") into exactly the original text. Word-level,
+  // not line-level: a flowing paragraph is one "line" to a line-diff, so
+  // two edits to different sentences in the same paragraph would otherwise
+  // look like the same line changed twice and register as a false conflict.
+  function tokenizeWords(text) {
+    return text.split(/(\s+)/).filter((token) => token !== "");
+  }
+
+  function countLines(text) {
+    if (!text) return 0;
+    const withoutTrailingNewline = text.endsWith("\n") ? text.slice(0, -1) : text;
+    return withoutTrailingNewline === "" ? 0 : withoutTrailingNewline.split("\n").length;
+  }
+
+  // Buckets a line-level diff into created/edited/deleted counts: a removed
+  // block immediately followed by an added block reads as an edit (up to
+  // the smaller side's line count); anything left over is a pure add/delete.
+  function summarizeLineChanges(oldText, newText) {
+    const parts = Diff.diffLines(oldText, newText);
+    let created = 0;
+    let edited = 0;
+    let deleted = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (part.removed) {
+        const next = parts[i + 1];
+        if (next?.added) {
+          const removedLines = countLines(part.value);
+          const addedLines = countLines(next.value);
+          edited += Math.min(removedLines, addedLines);
+          created += Math.max(0, addedLines - removedLines);
+          deleted += Math.max(0, removedLines - addedLines);
+          i++; // the paired added part is already accounted for
+        } else {
+          deleted += countLines(part.value);
+        }
+      } else if (part.added) {
+        created += countLines(part.value);
+      }
+    }
+    return { created, edited, deleted };
+  }
+
+  function formatCommitSummary({ created, edited, deleted }) {
+    const segments = [];
+    if (created) segments.push(`C:${created}`);
+    if (edited) segments.push(`E:${edited}`);
+    if (deleted) segments.push(`D:${deleted}`);
+    return segments.length ? segments.join(" ") : "No line changes";
   }
 
   function escapeHtml(str) {
@@ -142,12 +234,6 @@
   function updateWordCount() {
     const count = currentWordCount();
     els.wordCount.textContent = `${count} word${count === 1 ? "" : "s"}`;
-  }
-
-  function updateRepoTarget() {
-    els.repoTarget.textContent = state.repo
-      ? `Pushing to ${state.repo.owner}/${state.repo.repo} · ${state.repo.path} on ${state.repo.branch}`
-      : "No GitHub repository connected.";
   }
 
   // ---------- GitHub API ----------
@@ -214,6 +300,30 @@
     }));
   }
 
+  async function fetchHeadCommitSha(repo) {
+    const url = `${GITHUB_API}/repos/${repo.owner}/${repo.repo}/commits?path=${encodeURIComponentPath(repo.path)}&sha=${encodeURIComponent(repo.branch)}&per_page=1`;
+    const res = await fetch(url, { headers: authHeaders() });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data[0]?.sha || null;
+  }
+
+  // Three-way merge of the live draft onto a newer remote, using the last
+  // synced text as the ancestor. Same helper for the rebase button and the
+  // last-chance merge at push time.
+  function mergeDraftWithRemote(draft, base, remote) {
+    if (!remote || remote === base) {
+      return { conflict: false, markdown: draft, rebased: false };
+    }
+    const merged = Diff3.merge(
+      tokenizeWords(draft),
+      tokenizeWords(base),
+      tokenizeWords(remote)
+    );
+    if (merged.conflict) return { conflict: true };
+    return { conflict: false, markdown: merged.result.join(""), rebased: true };
+  }
+
   async function apiError(res) {
     let detail = "";
     try {
@@ -225,7 +335,7 @@
     if (res.status === 401) return new Error("Token was rejected. Reconnect with GitHub.");
     if (res.status === 403) return new Error(detail || "Forbidden — the token may lack write access to this repo.");
     if (res.status === 409) {
-      const err = new Error("The file changed on GitHub since you loaded it. Reload, then push again.");
+      const err = new Error("Someone pushed at the exact same moment. Push again — this time your edits will rebase onto theirs automatically.");
       err.code = "conflict";
       return err;
     }
@@ -370,35 +480,204 @@
 
   // Loads a file from GitHub into the editor and updates all connection
   // state. A missing file still counts as a valid connection — the first
-  // push will create it. Throws on any other failure.
-  async function connectToRepo(repo) {
+  // push will create it. Throws on any other failure. Pass silent to skip
+  // toasts (used for the unauthenticated first-load of the public manuscript).
+  async function connectToRepo(repo, opts = {}) {
     try {
       const { markdown, sha } = await fetchFile(repo);
       state.repo = repo;
       state.sha = sha;
+      state.baseMarkdown = canonicalMarkdown(markdown);
       store.set(REPO_KEY, repo);
       setEditorFromMarkdown(markdown);
       store.set(draftKey(repo), markdown);
+      store.set(baseKey(repo), state.baseMarkdown);
       state.viewingSha = null;
       els.revisionLabel.hidden = true;
       updateWordCount();
-      updateRepoTarget();
       await refreshCommitLog();
-      showToast(`Loaded ${repo.path} from ${repo.owner}/${repo.repo}`);
+      persistSync(sha, state.commits[0]?.sha || null);
+      startRemoteWatch();
+      if (!opts.silent) showToast(`Loaded ${repo.path} from ${repo.owner}/${repo.repo}`);
     } catch (err) {
       if (err.code !== "not_found") throw err;
       state.repo = repo;
       state.sha = null;
+      state.baseMarkdown = "";
       store.set(REPO_KEY, repo);
-      updateRepoTarget();
+      store.set(baseKey(repo), "");
+      persistSync(null, null);
       await refreshCommitLog();
-      showToast(`Connected. ${repo.path} doesn't exist yet — your first push will create it.`);
+      startRemoteWatch();
+      if (!opts.silent) {
+        showToast(`Connected. ${repo.path} doesn't exist yet — your first push will create it.`);
+      }
+    }
+  }
+
+  function hasUnsyncedLocalEdits(repo) {
+    const savedDraft = store.get(draftKey(repo), "");
+    if (!savedDraft) return false;
+    const savedBase = store.get(baseKey(repo), "");
+    return canonicalMarkdown(savedDraft) !== (savedBase || canonicalMarkdown(""));
+  }
+
+  async function bootManuscript() {
+    const repo = state.repo || defaultRepo();
+    if (hasUnsyncedLocalEdits(repo)) {
+      state.repo = repo;
+      setEditorFromMarkdown(store.get(draftKey(repo), ""));
+      updateWordCount();
+      state.baseMarkdown = store.get(baseKey(repo), "");
+      state.sha = store.get(shaKey(repo), null);
+      state.syncedCommitSha = store.get(headKey(repo), null);
+      refreshCommitLog();
+      startRemoteWatch();
+      return;
+    }
+
+    try {
+      await connectToRepo(repo, { silent: true });
+    } catch (err) {
+      setEditorFromMarkdown(store.get(draftKey(repo), ""));
+      updateWordCount();
+      showToast(`Couldn't load the manuscript: ${err.message}`, true);
+    }
+  }
+
+  function persistSync(blobSha, commitSha) {
+    state.sha = blobSha || null;
+    if (commitSha !== undefined) state.syncedCommitSha = commitSha || null;
+    if (!state.repo) return;
+    store.set(shaKey(state.repo), state.sha);
+    if (commitSha !== undefined) store.set(headKey(state.repo), state.syncedCommitSha);
+  }
+
+  function setBehind(behind) {
+    state.behind = !!behind;
+    els.rebaseButton.hidden = !state.behind;
+  }
+
+  function stopRemoteWatch() {
+    clearInterval(remotePollTimer);
+    remotePollTimer = null;
+  }
+
+  function startRemoteWatch() {
+    stopRemoteWatch();
+    setBehind(false);
+    if (!state.repo) return;
+    peekRemote({ force: true });
+    const interval = state.token ? REMOTE_POLL_MS : REMOTE_POLL_MS_UNAUTH;
+    remotePollTimer = setInterval(() => peekRemote(), interval);
+  }
+
+  // Compare origin to the last synced commit without touching the draft or
+  // the remembered base. The base is the merge ancestor and must stay frozen
+  // until a rebase (or push) succeeds.
+  async function peekRemote(opts = {}) {
+    if (!state.repo || remotePeekInFlight) return;
+    const now = Date.now();
+    if (!opts.force && now - lastRemotePeekAt < 2000) return;
+    lastRemotePeekAt = now;
+    remotePeekInFlight = true;
+    try {
+      const headSha = await fetchHeadCommitSha(state.repo);
+      if (headSha && state.syncedCommitSha) {
+        if (headSha === state.syncedCommitSha) {
+          setBehind(false);
+          return;
+        }
+        if (state.behind) return;
+      }
+
+      let remote;
+      try {
+        remote = await fetchFile(state.repo);
+      } catch (err) {
+        if (err.code === "not_found") {
+          if (!state.sha && !state.baseMarkdown) setBehind(false);
+          return;
+        }
+        throw err;
+      }
+
+      const remoteCanonical = canonicalMarkdown(remote.markdown);
+      if (remoteCanonical === state.baseMarkdown) {
+        persistSync(remote.sha, headSha);
+        setBehind(false);
+        return;
+      }
+
+      setBehind(true);
+    } catch {
+      // Offline or rate-limited: keep the last behind/synced state.
+    } finally {
+      remotePeekInFlight = false;
+    }
+  }
+
+  async function rebaseOntoRemote() {
+    if (!state.repo) return;
+    if (state.viewingSha) {
+      showToast("Return to your draft before rebasing.", true);
+      return;
+    }
+
+    els.rebaseButton.disabled = true;
+    try {
+      let remote;
+      try {
+        remote = await fetchFile(state.repo);
+      } catch (err) {
+        if (err.code === "not_found") {
+          setBehind(false);
+          showToast("The file is gone on GitHub.");
+          return;
+        }
+        throw err;
+      }
+
+      const remoteCanonical = canonicalMarkdown(remote.markdown);
+      const draft = editorMarkdown();
+      const merged = mergeDraftWithRemote(draft, state.baseMarkdown, remoteCanonical);
+      if (merged.conflict) {
+        showToast(
+          "Your edits overlap a new revision on GitHub. Copy your draft somewhere safe, then Load from GitHub and reapply it by hand.",
+          true
+        );
+        return;
+      }
+
+      state.baseMarkdown = remoteCanonical;
+      store.set(baseKey(state.repo), remoteCanonical);
+      store.set(draftKey(state.repo), merged.markdown);
+      if (merged.markdown !== draft) {
+        setEditorFromMarkdown(merged.markdown);
+        updateWordCount();
+      }
+
+      await refreshCommitLog();
+      persistSync(remote.sha, state.commits[0]?.sha || null);
+      setBehind(false);
+      showToast(merged.rebased ? "Rebased onto the latest revision." : "Already on the latest revision.");
+    } catch (err) {
+      showToast(`Couldn't rebase: ${err.message}`, true);
+    } finally {
+      els.rebaseButton.disabled = false;
     }
   }
 
   function resetConnection() {
+    stopRemoteWatch();
+    setBehind(false);
+    if (state.repo) {
+      store.set(shaKey(state.repo), null);
+      store.set(headKey(state.repo), null);
+    }
     state.repo = null;
     state.sha = null;
+    state.syncedCommitSha = null;
     state.commits = [];
     state.viewingSha = null;
     store.set(REPO_KEY, null);
@@ -406,7 +685,6 @@
     els.editor.contentEditable = "true";
     els.revisionLabel.hidden = true;
     renderCommitLog();
-    updateRepoTarget();
     populateSettingsForm();
     showToast("Connection reset. Reconnect below.");
   }
@@ -531,8 +809,7 @@
     }
     showToast(login ? `Connected as ${login}.` : "Connected to GitHub.");
 
-    // Authorization was the only missing piece — load the manuscript and go
-    // straight to the commit dialog instead of making the user do more.
+    // Authorization was the only missing piece — load the manuscript and push.
     if (!state.repo) {
       try {
         await connectToRepo(repoFromForm());
@@ -542,9 +819,12 @@
         els.manualSetup.open = true;
         return;
       }
+    } else {
+      startRemoteWatch();
     }
     els.settingsModal.close();
-    openPushModal();
+    if (pendingPushAfterAuth && state.token) requestPush();
+    pendingPushAfterAuth = false;
   }
 
   function cancelDeviceFlow() {
@@ -567,7 +847,8 @@
       }
       await connectToRepo(repo);
       els.settingsModal.close();
-      if (state.token) openPushModal();
+      if (pendingPushAfterAuth && state.token) requestPush();
+      pendingPushAfterAuth = false;
     } catch (err) {
       els.settingsError.textContent = err.message;
       els.settingsError.hidden = false;
@@ -579,79 +860,108 @@
 
   // ---------- push-to-GitHub flow ----------
 
-  function openPushModal() {
-    updateRepoTarget();
-    els.pushError.hidden = true;
-    els.pushMessage.value = "";
-    if (!state.repo) {
-      showToast("Connect a repository first.", true);
-      openModal(els.settingsModal);
-      return;
-    }
-    if (!state.token) {
-      showToast("Connect with GitHub to push.", true);
-      openModal(els.settingsModal);
-      return;
-    }
-    openModal(els.submitModal);
-    els.pushMessage.focus();
-  }
-
-  function openSettingsFromPush() {
-    els.submitModal.close();
+  function openSettings() {
+    pendingPushAfterAuth = false;
     populateSettingsForm();
     openModal(els.settingsModal);
   }
 
+  function requestPush() {
+    if (!state.repo || !state.token) {
+      pendingPushAfterAuth = true;
+      showToast("Connect with GitHub to push.", true);
+      populateSettingsForm();
+      openModal(els.settingsModal);
+      return;
+    }
+    handlePush();
+  }
+
   async function handlePush() {
-    const message = els.pushMessage.value.trim();
-    if (!message) {
-      els.pushError.textContent = "Give this commit a message.";
-      els.pushError.hidden = false;
-      els.pushMessage.focus();
+    if (pushInFlight) return;
+    if (state.viewingSha) {
+      showToast("Return to your draft before pushing.", true);
       return;
     }
 
     const wordCount = currentWordCount();
     if (wordCount >= MAX_WORD_COUNT) {
-      els.pushError.textContent = `This manuscript is ${wordCount} words — must stay under ${MAX_WORD_COUNT} to push. (See constants.js.)`;
-      els.pushError.hidden = false;
+      showToast(`This manuscript is ${wordCount} words — must stay under ${MAX_WORD_COUNT} to push.`, true);
       return;
     }
 
-    els.pushButton.disabled = true;
-    els.pushButton.textContent = "Pushing…";
-    els.pushError.hidden = true;
+    pushInFlight = true;
+    els.submitButton.disabled = true;
+    const previousLabel = els.submitButton.textContent;
+    els.submitButton.textContent = "Pushing…";
 
     try {
-      // Refetch the latest sha immediately before writing, so a concurrent
-      // edit on GitHub can't silently be clobbered.
-      let sha = state.sha;
+      const currentMarkdown = editorMarkdown();
+      const message = formatCommitSummary(summarizeLineChanges(state.baseMarkdown, currentMarkdown));
+
+      let remote = null;
       try {
-        const latest = await fetchFile(state.repo);
-        sha = latest.sha;
+        remote = await fetchFile(state.repo);
       } catch (err) {
         if (err.code !== "not_found") throw err;
-        sha = null; // file doesn't exist yet; this push will create it
+        remote = null;
+      }
+      const remoteCanonical = remote ? canonicalMarkdown(remote.markdown) : null;
+
+      let markdownToPush = currentMarkdown;
+      const sha = remote ? remote.sha : null;
+
+      if (remote && remoteCanonical !== state.baseMarkdown) {
+        const merged = mergeDraftWithRemote(currentMarkdown, state.baseMarkdown, remoteCanonical);
+        if (merged.conflict) {
+          const err = new Error(
+            "Your edits overlap a new revision on GitHub. Copy your draft somewhere safe, then Load from GitHub and reapply it by hand."
+          );
+          err.code = "conflict";
+          throw err;
+        }
+        markdownToPush = merged.markdown;
+        if (merged.rebased) showToast("Rebased your edits onto the latest version on GitHub.");
       }
 
-      const markdown = editorMarkdown();
-      const result = await pushFile(state.repo, markdown, message, sha);
-      state.sha = result.fileSha;
-      store.set(draftKey(state.repo), markdown);
+      if (remoteCanonical && markdownToPush === remoteCanonical) {
+        state.baseMarkdown = remoteCanonical;
+        store.set(baseKey(state.repo), remoteCanonical);
+        store.set(draftKey(state.repo), markdownToPush);
+        if (markdownToPush !== currentMarkdown) {
+          setEditorFromMarkdown(markdownToPush);
+          updateWordCount();
+        }
+        await refreshCommitLog();
+        persistSync(remote.sha, state.commits[0]?.sha || null);
+        setBehind(false);
+        showToast("Nothing to push.");
+        return;
+      }
+
+      const result = await pushFile(state.repo, markdownToPush, message, sha);
+      state.baseMarkdown = markdownToPush;
+      store.set(draftKey(state.repo), markdownToPush);
+      store.set(baseKey(state.repo), markdownToPush);
+      persistSync(result.fileSha, result.commitSha);
+      setBehind(false);
+
+      if (markdownToPush !== currentMarkdown) {
+        setEditorFromMarkdown(markdownToPush);
+        updateWordCount();
+      }
 
       const parentSha = state.commits[0]?.sha || null;
       state.commits.unshift({ sha: result.commitSha, shortSha: result.commitSha.slice(0, 7), message, parentSha });
       renderCommitLog();
 
-      els.submitModal.close();
       showToast("Pushed to GitHub.");
     } catch (err) {
-      els.pushError.textContent = err.message;
-      els.pushError.hidden = false;
+      showToast(err.message, true);
     } finally {
-      els.pushButton.disabled = false;
-      els.pushButton.textContent = "Push commit";
+      pushInFlight = false;
+      els.submitButton.disabled = false;
+      els.submitButton.textContent = previousLabel;
     }
   }
 
@@ -689,10 +999,6 @@
 
   function init() {
     populateSettingsForm();
-    updateRepoTarget();
-    setEditorFromMarkdown(store.get(draftKey(state.repo), ""));
-    updateWordCount();
-    if (state.repo) refreshCommitLog();
 
     els.editor.addEventListener("input", () => {
       updateWordCount();
@@ -716,12 +1022,19 @@
     els.deviceConnectButton.addEventListener("click", startDeviceFlow);
     els.deviceFlowCancel.addEventListener("click", cancelDeviceFlow);
 
-    els.submitButton.addEventListener("click", openPushModal);
-    els.pushButton.addEventListener("click", handlePush);
-    els.changeRepoButton.addEventListener("click", openSettingsFromPush);
+    els.submitButton.addEventListener("click", requestPush);
+    els.rebaseButton.addEventListener("click", rebaseOntoRemote);
+    els.settingsButton.addEventListener("click", openSettings);
     els.downloadButton.addEventListener("click", handleDownload);
 
     els.revisionLabel.addEventListener("click", returnToDraft);
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") peekRemote();
+    });
+    window.addEventListener("focus", () => peekRemote());
+
+    bootManuscript();
   }
 
   init();

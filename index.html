@@ -4,15 +4,26 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="A quiet, GitHub-backed manuscript editor." />
-    <title>Verso — manuscript revisions</title>
+    <title>gpuworld - public work</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="styles.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"
+        }
+      }
+    </script>
   </head>
   <body>
     <header class="topbar">
-      <button class="button button-dark" id="submit-button">Commit &amp; push</button>
+      <div class="cube-icon" id="cube-icon" aria-hidden="true"></div>
+      <div class="topbar-end">
+        <button class="topbar-action" id="rebase-button" type="button" hidden>New revision — rebase</button>
+        <button class="topbar-action" id="submit-button">Commit &amp; push</button>
+      </div>
     </header>
 
     <main class="page-shell">
@@ -33,6 +44,7 @@
 
       <footer class="manuscript-footer">
         <span id="word-count">0 words</span>
+        <button type="button" class="footer-action" id="settings-button">Settings</button>
       </footer>
 
       <nav class="commit-log" id="commit-log" aria-label="Commit history"></nav>
@@ -46,26 +58,6 @@
       <button data-block="blockquote" aria-label="Quote">“</button>
       <button data-command="createLink" aria-label="Add link">↗</button>
     </div>
-
-    <dialog class="modal modal-wide" id="submit-modal">
-      <form method="dialog" id="submit-form">
-        <button class="modal-close" value="cancel" aria-label="Close">×</button>
-        <p class="eyebrow">Commit &amp; push</p>
-        <h2>Write this revision straight to the repository.</h2>
-        <p class="modal-lede">This calls the GitHub API directly from your browser and pushes a real commit to the branch below. There is no pull request and no copy-paste — the file changes the moment you push.</p>
-        <label for="push-message">Commit message</label>
-        <input id="push-message" name="message" maxlength="72" placeholder="Tighten the opening scene" autocomplete="off" required />
-        <div class="repo-target-row">
-          <p class="repo-target" id="repo-target">No GitHub repository connected.</p>
-          <button type="button" class="reset-link" id="change-repo-button">Change</button>
-        </div>
-        <p class="form-error" id="push-error" role="alert" hidden></p>
-        <div class="modal-actions split-actions">
-          <button class="button button-quiet" type="button" id="download-button">Download .md</button>
-          <button class="button button-dark" type="button" id="push-button">Push commit <span aria-hidden="true">↗</span></button>
-        </div>
-      </form>
-    </dialog>
 
     <dialog class="modal" id="settings-modal">
       <form method="dialog" id="settings-form">
@@ -113,7 +105,8 @@
           </div>
         </details>
 
-        <div class="modal-actions">
+        <div class="modal-actions split-actions">
+          <button class="button button-quiet" type="button" id="download-button">Download .md</button>
           <button class="button button-quiet" value="cancel">Cancel</button>
         </div>
       </form>
@@ -123,7 +116,161 @@
     <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/turndown@7.2.0/dist/turndown.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff@5.2.0/dist/diff.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/node-diff3@3.1.2/dist/index.iife.min.js"></script>
     <script src="constants.js"></script>
     <script src="app.js"></script>
+    <script type="module">
+      import * as THREE from "three";
+
+      const VOXELS = [
+        [0, 0, 0], [1, 0, 0], [0, 2, 0], [1, 2, 0],
+        [0, 0, 1], [1, 0, 1], [2, 0, 1], [0, 1, 1], [2, 1, 1], [0, 2, 1], [1, 2, 1], [2, 2, 1],
+        [0, 0, 2], [1, 0, 2], [2, 0, 2], [0, 1, 2], [2, 1, 2], [0, 2, 2], [1, 2, 2], [2, 2, 2],
+      ];
+      const POSES = [
+        [[0, 0, -1], [0, 1, 0], [1, 0, 0]],
+        [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        [[0, 0, -1], [-1, 0, 0], [0, 1, 0]],
+        [[1, 0, 0], [0, 0, -1], [0, 1, 0]],
+      ];
+      const TURN_MS = 700;
+      const VIEW_SPAN = 1.5;
+      const LOCAL_EXTENT = 3;
+      const UNIT_SCALE = (LOCAL_EXTENT * 0.5 * 0.95) / LOCAL_EXTENT;
+
+      function quatFromCols(cols) {
+        const m = new THREE.Matrix4().makeBasis(
+          new THREE.Vector3(...cols[0]),
+          new THREE.Vector3(...cols[1]),
+          new THREE.Vector3(...cols[2])
+        );
+        return new THREE.Quaternion().setFromRotationMatrix(m);
+      }
+
+      function easeInOut(t) {
+        return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      }
+
+      const host = document.getElementById("cube-icon");
+      const wrap = document.createElement("div");
+      wrap.className = "cube-stage";
+      host.appendChild(wrap);
+
+      const ink =
+        getComputedStyle(document.documentElement).getPropertyValue("--ink").trim() || "#1c1b19";
+      const scene = new THREE.Scene();
+      const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
+      camera.position.set(0, 0, 8);
+      camera.lookAt(0, 0, 0);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, premultipliedAlpha: false });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.toneMapping = THREE.NoToneMapping;
+      if ("outputColorSpace" in renderer && THREE.SRGBColorSpace) {
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+      }
+      renderer.setClearColor(0x000000, 0);
+      renderer.domElement.style.cssText = "display:block;width:100%;height:100%;";
+      wrap.appendChild(renderer.domElement);
+
+      const quats = POSES.map(quatFromCols);
+      const box = new THREE.BoxGeometry(1, 1, 1);
+      const material = new THREE.MeshBasicMaterial({ color: ink, toneMapped: false });
+      const group = new THREE.Group();
+      group.scale.setScalar(UNIT_SCALE);
+      for (const [x, y, z] of VOXELS) {
+        const mesh = new THREE.Mesh(box, material);
+        mesh.position.set(x - 1, y - 1, z - 1);
+        group.add(mesh);
+      }
+      scene.add(group);
+      group.quaternion.copy(quats[0]);
+
+      let poseIndex = 0;
+      let fromPose = 0;
+      let toPose = 0;
+      let turning = false;
+      let turnStarted = 0;
+      let pendingTurns = 0;
+      let raf = 0;
+
+      function applyTurn(t) {
+        const e = easeInOut(Math.min(Math.max(t, 0), 1));
+        if (t <= 0) group.quaternion.copy(quats[fromPose]);
+        else if (t >= 1) group.quaternion.copy(quats[toPose]);
+        else group.quaternion.slerpQuaternions(quats[fromPose], quats[toPose], e);
+      }
+
+      function resize() {
+        const w = wrap.clientWidth;
+        const h = wrap.clientHeight;
+        if (w <= 0 || h <= 0) return;
+        const aspect = w / h;
+        if (aspect >= 1) {
+          camera.left = -VIEW_SPAN * aspect;
+          camera.right = VIEW_SPAN * aspect;
+          camera.top = VIEW_SPAN;
+          camera.bottom = -VIEW_SPAN;
+        } else {
+          camera.left = -VIEW_SPAN;
+          camera.right = VIEW_SPAN;
+          camera.top = VIEW_SPAN / aspect;
+          camera.bottom = -VIEW_SPAN / aspect;
+        }
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h, false);
+        if (!raf) renderer.render(scene, camera);
+      }
+
+      function beginTurn(now) {
+        turning = true;
+        turnStarted = now;
+        fromPose = poseIndex;
+        poseIndex = (poseIndex + 1) % quats.length;
+        toPose = poseIndex;
+      }
+
+      function frame(now) {
+        const t = (now - turnStarted) / TURN_MS;
+        applyTurn(Math.min(Math.max(t, 0), 1));
+        if (t >= 1) {
+          turning = false;
+          applyTurn(1);
+          renderer.render(scene, camera);
+          if (pendingTurns > 0) {
+            pendingTurns -= 1;
+            beginTurn(now);
+          } else {
+            raf = 0;
+            return;
+          }
+        }
+        renderer.render(scene, camera);
+        raf = requestAnimationFrame(frame);
+      }
+
+      function nudge() {
+        if (turning) {
+          pendingTurns += 1;
+          return;
+        }
+        beginTurn(performance.now());
+        applyTurn(0);
+        renderer.render(scene, camera);
+        if (!raf) raf = requestAnimationFrame(frame);
+      }
+
+      addEventListener("resize", resize);
+      if (typeof ResizeObserver !== "undefined") new ResizeObserver(resize).observe(wrap);
+      resize();
+      requestAnimationFrame(resize);
+
+      document.addEventListener("keydown", (event) => {
+        if (event.repeat) return;
+        if (event.metaKey || event.ctrlKey || event.altKey) return;
+        if (event.key === "Meta" || event.key === "Control" || event.key === "Alt" || event.key === "Shift") return;
+        nudge();
+      });
+    </script>
   </body>
 </html>
